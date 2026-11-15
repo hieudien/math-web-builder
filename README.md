@@ -1,6 +1,6 @@
 # math-web-builder
 
-Skill cho Claude Code: **dựng trọn một web app chatbot gia sư Toán** (tên mẫu: MathStep AI) chỉ bằng cách mô tả chức năng bằng tiếng Việt thường. Bạn không cần biết lập trình.
+Skill cho Claude Code: **dựng trọn một web app chatbot gia sư Toán** chỉ bằng cách mô tả chức năng bằng tiếng Việt thường. Bạn không cần biết lập trình.
 
 App làm ra gồm:
 - **Giáo viên** tạo đề (gõ tay, chụp ảnh, tải file Word), gửi link cho học sinh, xem điểm mạnh yếu từng em.
