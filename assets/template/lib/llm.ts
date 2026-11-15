@@ -1,0 +1,219 @@
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { z } from "zod";
+import { fallbackChain, type Provider } from "@/lib/models";
+
+export type LlmCfg = {
+  provider: Provider;
+  key: string;
+  model: string;
+  temperature: number;
+  think?: boolean | "low"; // true: suy nghĩ sâu (chậm hơn); "low": suy nghĩ nhẹ (nhận xét bước giải). Mặc định tắt: chat cần nhanh
+  maxTokens?: number; // giới hạn độ dài trả lời, tránh model nói dài
+  onFallback?: (from: string, to: string, reason: string) => void; // để ghi nhật ký khi tự đổi model
+  onUsage?: (u: Usage) => void; // mỗi lượt gọi thành công: số token để đo chi phí và kiểm tra cache
+  signal?: AbortSignal; // askJson đặt khi hủy lượt gọi chậm, khỏi bị tính tiền thêm
+  seed?: number; // Gemini: cùng seed + cùng input thì (gần như) cùng câu trả lời. Không bảo đảm tuyệt đối.
+  teacherId?: string; // giáo viên sở hữu key: để nơi nuốt lỗi AI vẫn ghi được vào nhật ký lỗi của giáo viên đó
+  use?: string; // nhãn "dùng làm gì" của lượt gọi, ghi vào nhật ký để thống kê token
+};
+export type Usage = { provider: Provider; model: string; input: number; cached: number; output: number; thoughts: number; use?: string; ms?: number };
+export type Turn = { role: "user" | "model"; text: string; image?: { mime: string; b64: string } };
+
+// Structured output của Gemini: ép đúng khung JSON, khỏi mô tả định dạng trong prompt và khỏi gọi lại khi JSON sai.
+const DROP = new Set(["$schema", "default", "minimum", "maximum", "additionalProperties"]);
+const clean = (n: unknown): unknown => Array.isArray(n) ? n.map(clean) : n && typeof n === "object" ? Object.fromEntries(Object.entries(n).filter(([k]) => !DROP.has(k)).map(([k, v]) => [k, clean(v)])) : n;
+const jsonSchema = (schema: z.ZodType) => { try { return clean(z.toJSONSchema(schema, { io: "input" })); } catch { return undefined; } };
+
+async function callGemini(cfg: LlmCfg, system: string, turns: Turn[], schema?: z.ZodType, text = false) {
+  const ai = new GoogleGenAI({ apiKey: cfg.key });
+  const base = { systemInstruction: system, responseMimeType: text ? "text/plain" : "application/json", responseJsonSchema: text ? undefined : schema && jsonSchema(schema), temperature: cfg.temperature, seed: cfg.seed, maxOutputTokens: cfg.maxTokens, abortSignal: cfg.signal };
+  const run = (extra: object) => ai.models.generateContent({ model: cfg.model, contents: turns.map((t) => ({ role: t.role, parts: [{ text: t.text }, ...(t.image ? [{ inlineData: { mimeType: t.image.mime, data: t.image.b64 } }] : [])] })), config: { ...base, ...extra } });
+  // Tắt suy nghĩ để trả lời nhanh; model không hỗ trợ mức này (báo lỗi liên quan "thinking") thì gọi lại như thường.
+  let res;
+  try {
+    res = await run(cfg.think === true ? {} : { thinkingConfig: { thinkingLevel: cfg.think === "low" ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL } });
+  } catch (e) {
+    if (cfg.think === true || !/thinking/i.test(String(e))) throw e;
+    res = await run({});
+  }
+  const u = res.usageMetadata;
+  if (u) cfg.onUsage?.({ provider: "gemini", model: cfg.model, input: u.promptTokenCount ?? 0, cached: u.cachedContentTokenCount ?? 0, output: u.candidatesTokenCount ?? 0, thoughts: u.thoughtsTokenCount ?? 0, use: cfg.use });
+  return res.text ?? "";
+}
+
+// Model nào vừa báo hết quota thì nhớ lại một lúc để các lượt sau bỏ qua ngay, khỏi gọi lại vô ích.
+// ponytail: bộ nhớ của 1 instance. Dùng bảng DB/Redis nếu chạy nhiều instance.
+const dead = new Map<string, number>();
+const deadKey = (c: LlmCfg, model: string) => `${c.provider}:${c.key.slice(-8)}:${model}`;
+const isQuota = (e: unknown) => /PerDay|RESOURCE_EXHAUSTED|429|no longer available|404/i.test(String(e));
+const isOverload = (e: unknown) => /\b50\d\b|UNAVAILABLE|overload|high demand|AI_SLOW/i.test(String(e));
+const isLongQuota = (e: unknown) => /PerDay|no longer available|404/i.test(String(e));
+
+// Hết quota (hoặc model không còn) thì tự thử model kế tiếp của cùng nhà cung cấp, tối đa 4 model.
+export async function askJson<T extends z.ZodType>(cfg0: LlmCfg, system: string, turns: Turn[], schema: T, opts: { think?: boolean | "low"; maxTokens?: number; deadlineMs?: number; attemptMs?: number; use?: string; temperature?: number; seed?: number; models?: string[] } = {}): Promise<z.infer<T>> {
+  const cfg = { ...cfg0, ...opts };
+  const deadline = Date.now() + (opts.deadlineMs ?? Infinity); // chat đặt hạn chót để trả lỗi thân thiện trước khi trình duyệt tự báo timeout
+  const all = opts.models?.length ? opts.models : fallbackChain(cfg.provider, cfg.model); // models: chuỗi model cố định cho riêng lượt này
+  const alive = all.filter((m) => (dead.get(deadKey(cfg, m)) ?? 0) < Date.now());
+  const chain = alive.length ? alive : [cfg.model];
+  let last: unknown;
+  for (let i = 0; i < chain.length; i++) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw last ?? new Error("AI_TIMEOUT: quá thời gian chờ AI");
+    // Mỗi model (trừ model cuối) chỉ được chờ attemptMs: Google thỉnh thoảng chậm 5-9s, chờ tiếp không bằng đổi model ngay.
+    const cap = i + 1 < chain.length ? Math.min(left, opts.attemptMs ?? Infinity) : left;
+    const ac = new AbortController(); // hủy request khi quá hạn: không hủy thì Google vẫn tính tiền lượt đó
+    try {
+      const run = askOne({ ...cfg, model: chain[i], signal: ac.signal }, system, turns, schema);
+      if (cap === Infinity) return await run;
+      let timer: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<never>((_, rej) => { timer = setTimeout(() => { rej(new Error(cap < left ? "AI_SLOW: model trả lời quá chậm" : "AI_TIMEOUT: quá thời gian chờ AI")); ac.abort(); }, cap); });
+      return await Promise.race([run, timeout]).finally(() => clearTimeout(timer));
+    } catch (e) {
+      if (/AI_TIMEOUT/.test(String(e))) throw last && isQuota(last) ? last : e;
+      const quota = isQuota(e);
+      if (!quota && !isOverload(e)) throw e;
+      last = e;
+      // Hết quota ngày: nhớ 1 giờ. 429 theo phút chỉ tạm thời (cả lớp dùng chung 1 key): nhớ 20 giây. Quá tải 503: 1 phút.
+      dead.set(deadKey(cfg, chain[i]), Date.now() + (isLongQuota(e) ? 3_600_000 : quota || /AI_SLOW/.test(String(e)) ? 20_000 : 60_000));
+      if (i + 1 < chain.length) cfg.onFallback?.(chain[i], chain[i + 1], String(e).slice(0, 120));
+    }
+  }
+  throw last;
+}
+
+// Như askJson nhưng trả văn bản thuần (không ép JSON): dùng khi nội dung có nhiều dấu \ của LaTeX mà JSON hay làm hỏng.
+// Cùng cơ chế hết hạn chót, đổi model khi hết quota hoặc quá tải; không tự kiểm tra định dạng, nơi gọi tự tách.
+export async function askText(cfg0: LlmCfg, system: string, turns: Turn[], opts: { think?: boolean | "low"; maxTokens?: number; deadlineMs?: number; attemptMs?: number; use?: string; temperature?: number; seed?: number; models?: string[] } = {}): Promise<string> {
+  const cfg = { ...cfg0, ...opts };
+  const deadline = Date.now() + (opts.deadlineMs ?? Infinity);
+  const all = opts.models?.length ? opts.models : fallbackChain(cfg.provider, cfg.model); // models: chuỗi model cố định cho riêng lượt này
+  const alive = all.filter((m) => (dead.get(deadKey(cfg, m)) ?? 0) < Date.now());
+  const chain = alive.length ? alive : [cfg.model];
+  let last: unknown;
+  for (let i = 0; i < chain.length; i++) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw last ?? new Error("AI_TIMEOUT: quá thời gian chờ AI");
+    const cap = i + 1 < chain.length ? Math.min(left, opts.attemptMs ?? Infinity) : left;
+    const ac = new AbortController();
+    try {
+      const run = askOneText({ ...cfg, model: chain[i], signal: ac.signal }, system, turns);
+      if (cap === Infinity) return await run;
+      let timer: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<never>((_, rej) => { timer = setTimeout(() => { rej(new Error(cap < left ? "AI_SLOW: model trả lời quá chậm" : "AI_TIMEOUT: quá thời gian chờ AI")); ac.abort(); }, cap); });
+      return await Promise.race([run, timeout]).finally(() => clearTimeout(timer));
+    } catch (e) {
+      if (/AI_TIMEOUT/.test(String(e))) throw last && isQuota(last) ? last : e;
+      const quota = isQuota(e);
+      if (!quota && !isOverload(e)) throw e;
+      last = e;
+      dead.set(deadKey(cfg, chain[i]), Date.now() + (isLongQuota(e) ? 3_600_000 : quota || /AI_SLOW/.test(String(e)) ? 20_000 : 60_000));
+      if (i + 1 < chain.length) cfg.onFallback?.(chain[i], chain[i + 1], String(e).slice(0, 120));
+    }
+  }
+  throw last;
+}
+
+// Trả văn bản DẦN DẦN (streaming): onText nhận từng đoạn chữ mới, trả false thì dừng luồng ngay (hủy request).
+// Chỉ đổi model khi lỗi xảy ra TRƯỚC chữ đầu tiên (hết quota, quá tải, quá chậm): đã có chữ ra màn hình thì không đổi giữa chừng.
+export async function streamText(cfg0: LlmCfg, system: string, turns: Turn[], onText: (t: string) => boolean | void, opts: { think?: boolean | "low"; maxTokens?: number; deadlineMs?: number; attemptMs?: number; use?: string; temperature?: number; seed?: number; models?: string[] } = {}): Promise<string> {
+  const cfg = { ...cfg0, ...opts };
+  const deadline = Date.now() + (opts.deadlineMs ?? 40_000);
+  const all = opts.models?.length ? opts.models : fallbackChain(cfg.provider, cfg.model);
+  const alive = all.filter((m) => (dead.get(deadKey(cfg, m)) ?? 0) < Date.now());
+  const chain = alive.length ? alive : [cfg.model];
+  const contents = turns.map((t) => ({ role: t.role, parts: [{ text: t.text }] }));
+  let last: unknown;
+  for (let i = 0; i < chain.length; i++) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw last ?? new Error("AI_TIMEOUT: quá thời gian chờ AI");
+    const cap = i + 1 < chain.length ? Math.min(left, opts.attemptMs ?? 8000) : left; // chờ chữ đầu tiên tối đa cap
+    const ac = new AbortController();
+    let got = false, full = "", timedOut = "";
+    const timer = setTimeout(() => { timedOut = cap < left ? "AI_SLOW: model trả lời quá chậm" : "AI_TIMEOUT: quá thời gian chờ AI"; ac.abort(); }, cap);
+    const t0 = Date.now();
+    try {
+      const ai = new GoogleGenAI({ apiKey: cfg.key });
+      const base = { systemInstruction: system, responseMimeType: "text/plain", temperature: cfg.temperature, seed: cfg.seed, maxOutputTokens: cfg.maxTokens, abortSignal: ac.signal };
+      const open = (extra: object) => ai.models.generateContentStream({ model: chain[i], contents, config: { ...base, ...extra } });
+      let stream;
+      try {
+        stream = await open(cfg.think === true ? {} : { thinkingConfig: { thinkingLevel: cfg.think === "low" ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL } });
+      } catch (e) {
+        if (cfg.think === true || !/thinking/i.test(String(e))) throw e;
+        stream = await open({});
+      }
+      let usage;
+      for await (const ch of stream) {
+        usage = ch.usageMetadata ?? usage;
+        const t = ch.text ?? "";
+        if (!got && t) { got = true; clearTimeout(timer); }
+        if (!t) continue;
+        full += t;
+        if (onText(t) === false) { ac.abort(); break; }
+      }
+      clearTimeout(timer);
+      if (usage) cfg.onUsage?.({ provider: "gemini", model: chain[i], input: usage.promptTokenCount ?? 0, cached: usage.cachedContentTokenCount ?? 0, output: usage.candidatesTokenCount ?? 0, thoughts: usage.thoughtsTokenCount ?? 0, use: cfg.use, ms: Date.now() - t0 });
+      return full;
+    } catch (e) {
+      clearTimeout(timer);
+      const err = timedOut ? new Error(timedOut) : e;
+      if (got) return full; // lỗi giữa chừng khi đã có chữ: giữ phần đã nhận
+      if (/AI_TIMEOUT/.test(String(err))) throw last && isQuota(last) ? last : err;
+      const quota = isQuota(err);
+      if (!quota && !isOverload(err)) throw err;
+      last = err;
+      dead.set(deadKey(cfg, chain[i]), Date.now() + (isLongQuota(err) ? 3_600_000 : quota || /AI_SLOW/.test(String(err)) ? 20_000 : 60_000));
+      if (i + 1 < chain.length) cfg.onFallback?.(chain[i], chain[i + 1], String(err).slice(0, 120));
+    }
+  }
+  throw last;
+}
+
+async function askOneText(cfg: LlmCfg, system: string, turns: Turn[]): Promise<string> {
+  const t0 = Date.now();
+  const c = { ...cfg, onUsage: cfg.onUsage && ((u: Usage) => cfg.onUsage!({ ...u, ms: Date.now() - t0 })) };
+  return withRetry(() => callGemini(c, system, turns, undefined, true));
+}
+
+async function askOne<T extends z.ZodType>(cfg: LlmCfg, system: string, turns: Turn[], schema: T): Promise<z.infer<T>> {
+  let lastErr = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const t = lastErr ? [...turns, { role: "user" as const, text: `JSON trước không hợp lệ (${lastErr}). Trả lại JSON đúng định dạng.` }] : turns;
+    const t0 = Date.now();
+    const c = { ...cfg, onUsage: cfg.onUsage && ((u: Usage) => cfg.onUsage!({ ...u, ms: Date.now() - t0 })) }; // ms: thời gian chờ AI của lượt gọi này
+    const text = await withRetry(() => callGemini(c, system, t, schema));
+    try {
+      const parsed = schema.safeParse(JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, "")));
+      if (parsed.success) return parsed.data;
+      lastErr = parsed.error.issues.map((i) => i.path.join(".") + " " + i.message).join("; ");
+    } catch {
+      lastErr = "không phải JSON";
+    }
+  }
+  throw new Error("Mô hình AI trả dữ liệu sai định dạng: " + lastErr);
+}
+
+// Kiểm tra key và model bằng cách tra thông tin model: không tốn lượt gọi sinh nội dung.
+export async function checkKey(provider: Provider, key: string, model: string) {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}`, { headers: { "x-goog-api-key": key } });
+  if (r.ok) return;
+  if (r.status === 401 || r.status === 403 || r.status === 400) throw new Error("key");
+  if (r.status === 404) throw new Error("model");
+  throw new Error("other " + r.status);
+}
+
+// Hết quota theo ngày (PerDay) thì không thử lại: chờ cũng vô ích.
+// 503 và 429 tạm thời: thử lại 2 lần, cách nhau 4–8 giây.
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const s = String(e);
+      // 429 / hết quota: không chờ, askJson đổi sang model khác ngay. Chỉ thử lại lỗi tạm thời (5xx, quá tải, mạng).
+      if (i >= 1 || /PerDay|429|RESOURCE_EXHAUSTED/.test(s) || !/\b50\d\b|UNAVAILABLE|overload|fetch failed/i.test(s)) throw e;
+      await new Promise((r) => setTimeout(r, 1500)); // thử lại đúng 1 lần, rồi askJson đổi model
+    }
+  }
+}
